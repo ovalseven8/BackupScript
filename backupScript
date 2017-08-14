@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+
+import datetime
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+
+from config import *
+
+DATE = datetime.datetime.now().strftime("%Y-%m-%d")
+TIME = datetime.datetime.now().strftime("%H:%M:%S")
+HOSTNAME = socket.gethostname()
+
+os.environ["BORG_PASSPHRASE"] = PASSPHRASE
+
+# Set up logging
+logging.basicConfig(filename=LOGFILE_PATH, level=LOGGING_LEVEL,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
+
+def borg_repository_exists():
+    if not os.path.exists(REPOSITORY_LOCATION):
+        return False
+    elif os.listdir(REPOSITORY_LOCATION) == []:
+        return False
+    else:
+        return True
+
+def init_borg_repository():
+    process_init = subprocess.run(["borg", "init", "--encryption=repokey-blake2", REPOSITORY_LOCATION],
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+
+    if process_init.returncode == 0:
+        logging.info("Initialized BorgBackup repository.")
+    elif process_init.returncode == 1:
+        logging.warning("Initialized BorgBackup, however there is a warning. " + process_init.stderr.decode("utf-8"))
+    else:
+        logging.critical("Could not initialize BorgBackup repository. " + process_init.stderr.decode("utf-8"))
+        sys.exit(1)
+
+def get_file_with_excluded_dicts():
+    temp_file = tempfile.NamedTemporaryFile(mode="r+")
+    for excluded_directory in EXCLUDED_DIRECTORIES:
+        temp_file.write(excluded_directory + "\n")
+    temp_file.flush()
+    return temp_file
+
+def create_backup(temp_file=get_file_with_excluded_dicts()):
+    process_create = subprocess.run(["borg", "create",
+                                     REPOSITORY_LOCATION + "::" + HOSTNAME + "-" + DATE,
+                                     DIRECTORY_TO_BACKUP,
+                                     "--exclude-from", temp_file.name,
+                                     "--compression", "lz4"],
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE)
+
+    if process_create.returncode == 0:
+        update_datefile()
+        logging.info("Backup successful.")
+        #TODO: Optional more precise output (e.g. backup size)?
+    elif process_create.returncode == 1:
+        logging.warning("Backup reached its normal end, but there were "
+                        "warnings. The backup date in the file " + LOGFILE_PATH +
+                        " has not been updated. "
+                        + process_create.stderr.decode("utf-8"))
+    else:
+        logging.error("Could not create backup." + process_create.stderr.decode("utf-8"))
+
+
+def update_datefile():
+    try:
+        with open(BACKUP_DATE_FILE_PATH, "w") as date_file:
+            date_file.seek(0)
+            date_file.write(DATE)
+    except PermissionError:
+        logging.warning("Could not update date of latest backup because of missing permissions.")
+
+def prune_backups():
+    process_prune = subprocess.run(["borg", "prune", REPOSITORY_LOCATION, "--prefix",
+                                    HOSTNAME + "-",
+                                    "--keep-daily=" + KEEP_DAILY,
+                                    "--keep-weekly=" + KEEP_WEEKLY,
+                                    "--keep-monthly=" + KEEP_MONTHLY],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+
+    if process_prune.returncode == 0:
+        logging.info("Prune successful.")
+    elif process_prune.returncode == 1:
+        logging.warning("Warning for prune command. " + process_prune.stderr.decode("utf-8"))
+    else:
+        logging.warning("Error while executing 'prune' command." + process_prune.stderr.decode("utf-8"))
+
+def mount():
+    # Note here that 'vers=1.0' is required because FRITZ!Box only supports SMB 1.0
+    process_mount = subprocess.run(["mount", "-t", "cifs", "-o", "credentials=" + SMB_CREDENTIALS_FILE + "," + \
+                                    "vers=1.0", "//" + SHARE_ADDRESS, MOUNT_POINT],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+    if process_mount.returncode == 0:
+        logging.info(SHARE_ADDRESS + " has been mounted.")
+    else:
+        logging.critical("Could not mount Samba share. " + process_mount.stderr.decode("utf-8"))
+        sys.exit(1)
+
+def umount():
+    process_umount = subprocess.run(["umount", MOUNT_POINT],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+    if process_umount.returncode == 0:
+        logging.info("Umount successful.")
+    else:
+        logging.warning("Umount returncode is not 0. " + process_umount.stderr.decode("utf-8"))
+
+
+if __name__ == "__main__":
+    logging.info("Script started ...")
+
+    if not os.path.isdir(REPOSITORY_LOCATION):
+        mount()
+    else:
+        logging.warning(SHARE_ADDRESS + " already mounted!")
+
+    if not borg_repository_exists():
+        init_borg_repository()
+
+    create_backup()
+
+    prune_backups()
+
+    umount()
+
+    logging.info("Script has been completed." + "\n" + \
+                 "=====================================")
